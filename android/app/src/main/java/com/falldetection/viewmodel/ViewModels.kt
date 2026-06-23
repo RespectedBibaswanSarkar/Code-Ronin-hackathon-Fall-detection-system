@@ -1,6 +1,9 @@
 package com.falldetection.viewmodel
 
 import android.app.Application
+import android.content.Intent
+import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.falldetection.integration.AlertRequest
@@ -81,6 +84,7 @@ class AlertViewModel(application: Application) : AndroidViewModel(application) {
         .build()
 
     private val apiService: ApiService = retrofit.create(ApiService::class.java)
+    private val twilioOfflinePort = com.falldetection.integration.TwilioOfflinePort(application)
 
     private val _alertState = MutableStateFlow<AlertState>(AlertState())
     val alertState: StateFlow<AlertState> = _alertState.asStateFlow()
@@ -90,6 +94,24 @@ class AlertViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isSoSTriggered = MutableStateFlow(false)
     val isSoSTriggered: StateFlow<Boolean> = _isSoSTriggered.asStateFlow()
+
+    val emergencyContacts = repository.getAllContacts()
+
+    private val _isOnline = MutableStateFlow(true)
+    val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
+
+    init {
+        checkConnectivity()
+    }
+
+    private fun checkConnectivity() {
+        viewModelScope.launch {
+            while (true) {
+                _isOnline.value = twilioOfflinePort.isNetworkAvailable()
+                kotlinx.coroutines.delay(2000)
+            }
+        }
+    }
 
     fun setFallAlert(event: FallDetectionEvent, confidence: Float, quantumConfidence: Float = 0f) {
         _alertState.value = AlertState(
@@ -113,6 +135,7 @@ class AlertViewModel(application: Application) : AndroidViewModel(application) {
         val event = _alertState.value.event
         if (event != null) {
             viewModelScope.launch {
+                // 1. Try Backend API (if online)
                 try {
                     val request = AlertRequest(
                         timestamp = event.timestamp,
@@ -127,12 +150,82 @@ class AlertViewModel(application: Application) : AndroidViewModel(application) {
                     val response = apiService.sendAlert(request)
                     if (response.isSuccessful) {
                         updateEventWithSOS(event.id)
-                    } else {
-                        // Handle error
                     }
                 } catch (e: Exception) {
-                    // Handle exception
+                    Log.e("AlertViewModel", "API Alert failed: ${e.message}")
                 }
+
+                // 2. Trigger Twilio / Native SMS Fallback (Presentation Mode)
+                val allContacts = try {
+                    repository.getAllContacts().first()
+                } catch (e: Exception) {
+                    emptyList<com.falldetection.model.EmergencyContact>()
+                }
+                
+                Log.d("AlertViewModel", "Found ${allContacts.size} contacts in database")
+                
+                var targetContacts = allContacts.filter { it.isActive }
+                if (targetContacts.isEmpty() && allContacts.isNotEmpty()) {
+                    Log.w("AlertViewModel", "No ACTIVE contacts, falling back to any available contact")
+                    targetContacts = allContacts
+                }
+
+                if (targetContacts.isNotEmpty()) {
+                    twilioOfflinePort.sendAlertsToContacts(
+                        targetContacts,
+                        "Lat: ${event.latitude}, Lon: ${event.longitude}",
+                        event.mapsLink
+                    )
+                } else {
+                    Log.e("AlertViewModel", "CRITICAL: No contacts found. Sending to DEFAULT TEST NUMBER for presentation.")
+                    // HARDCODED FALLBACK FOR PRESENTATION
+                    val demoContact1 = com.falldetection.model.EmergencyContact(
+                        name = "Presentation Fallback 1",
+                        phoneNumber = "+919366113970",
+                        isActive = true
+                    )
+                    val demoContact2 = com.falldetection.model.EmergencyContact(
+                        name = "User Requested SOS",
+                        phoneNumber = "+919433065609",
+                        isActive = true
+                    )
+                    twilioOfflinePort.sendAlertsToContacts(
+                        listOf(demoContact1, demoContact2),
+                        "Lat: ${event.latitude}, Lon: ${event.longitude}",
+                        event.mapsLink
+                    )
+                }
+
+                // 3. Automated Emergency Call (Primary or Hardcoded Fallback)
+                val primaryContact = allContacts.find { it.isPrimary }
+                val targetPhone = primaryContact?.phoneNumber ?: "9433065609"
+                
+                val callIntent = Intent(Intent.ACTION_CALL).apply {
+                    data = Uri.parse("tel:$targetPhone")
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                
+                val app = getApplication<Application>()
+                if (app.checkSelfPermission(android.Manifest.permission.CALL_PHONE) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    app.startActivity(callIntent)
+                    Log.d("AlertViewModel", "Initiated Native Call to: $targetPhone")
+                } else {
+                    Log.e("AlertViewModel", "CALL_PHONE permission not granted!")
+                }
+            }
+        }
+    }
+
+    fun triggerSelectiveSoS(contact: com.falldetection.model.EmergencyContact) {
+        _isSoSTriggered.value = true
+        val event = _alertState.value.event
+        if (event != null) {
+            viewModelScope.launch {
+                twilioOfflinePort.sendAlertsToContacts(
+                    listOf(contact),
+                    "Lat: ${event.latitude}, Lon: ${event.longitude}",
+                    event.mapsLink
+                )
             }
         }
     }
@@ -187,6 +280,15 @@ class ContactsViewModel(application: Application) : AndroidViewModel(application
                 email = email
             )
             repository.insertContact(contact)
+        }
+    }
+
+    fun setPrimaryContact(contact: com.falldetection.model.EmergencyContact) {
+        viewModelScope.launch {
+            val contacts = repository.getAllContacts().first()
+            contacts.forEach { 
+                repository.updateContact(it.copy(isPrimary = it.id == contact.id))
+            }
         }
     }
 
